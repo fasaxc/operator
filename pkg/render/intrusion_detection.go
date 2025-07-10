@@ -275,7 +275,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionClusterRole() *rbacv1.Cl
 				"licensekeys",
 			},
 			Verbs: []string{
-				"get", "watch",
+				"get", "list", "watch",
 			},
 		},
 		{
