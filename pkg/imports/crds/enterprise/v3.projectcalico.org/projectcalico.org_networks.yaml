@@ -1,0 +1,248 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: networks.projectcalico.org
+spec:
+  group: projectcalico.org
+  names:
+    kind: Network
+    listKind: NetworkList
+    plural: networks
+    singular: network
+  preserveUnknownFields: false
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns:
+        - description: The network type
+          jsonPath: .status.type
+          name: Type
+          type: string
+        - description: Bridge device name
+          jsonPath: .spec.l2Bridge.bridge.name
+          name: Bridge
+          type: string
+        - description: Configured VLAN IDs
+          jsonPath: .status.vlans
+          name: VLANs
+          type: string
+        - description: Age of the resource
+          jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v3
+      schema:
+        openAPIV3Schema:
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              maxProperties: 1
+              minProperties: 1
+              properties:
+                l2Bridge:
+                  properties:
+                    bridge:
+                      properties:
+                        name:
+                          maxLength: 15
+                          minLength: 1
+                          type: string
+                      required:
+                        - name
+                      type: object
+                    hostConnections:
+                      items:
+                        maxProperties: 1
+                        minProperties: 1
+                        properties:
+                          trunkPort:
+                            properties:
+                              interfaceMatchRules:
+                                items:
+                                  properties:
+                                    interface:
+                                      maxProperties: 1
+                                      minProperties: 1
+                                      properties:
+                                        name:
+                                          maxLength: 15
+                                          minLength: 1
+                                          type: string
+                                      type: object
+                                    nodeSelector:
+                                      type: string
+                                  required:
+                                    - interface
+                                  type: object
+                                minItems: 1
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              vlans:
+                                items:
+                                  maxProperties: 1
+                                  minProperties: 1
+                                  properties:
+                                    id:
+                                      maximum: 4094
+                                      minimum: 1
+                                      type: integer
+                                    range:
+                                      properties:
+                                        end:
+                                          maximum: 4094
+                                          minimum: 1
+                                          type: integer
+                                        start:
+                                          maximum: 4094
+                                          minimum: 1
+                                          type: integer
+                                      required:
+                                        - end
+                                        - start
+                                      type: object
+                                  type: object
+                                minItems: 1
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                              - interfaceMatchRules
+                              - vlans
+                            type: object
+                        type: object
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    subnets:
+                      items:
+                        properties:
+                          cidrs:
+                            items:
+                              type: string
+                            minItems: 1
+                            type: array
+                          vlan:
+                            maximum: 4094
+                            minimum: 0
+                            type: integer
+                        required:
+                          - cidrs
+                          - vlan
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    workloadConnections:
+                      items:
+                        maxProperties: 1
+                        minProperties: 1
+                        properties:
+                          accessPort:
+                            maxProperties: 1
+                            minProperties: 1
+                            properties:
+                              allowedVLANs:
+                                items:
+                                  maxProperties: 1
+                                  minProperties: 1
+                                  properties:
+                                    id:
+                                      maximum: 4094
+                                      minimum: 1
+                                      type: integer
+                                    range:
+                                      properties:
+                                        end:
+                                          maximum: 4094
+                                          minimum: 1
+                                          type: integer
+                                        start:
+                                          maximum: 4094
+                                          minimum: 1
+                                          type: integer
+                                      required:
+                                        - end
+                                        - start
+                                      type: object
+                                  type: object
+                                minItems: 1
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              vlan:
+                                properties:
+                                  id:
+                                    maximum: 4094
+                                    minimum: 1
+                                    type: integer
+                                required:
+                                  - id
+                                type: object
+                            type: object
+                        type: object
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-type: atomic
+                  required:
+                    - bridge
+                    - hostConnections
+                    - workloadConnections
+                  type: object
+              type: object
+            status:
+              properties:
+                conditions:
+                  items:
+                    properties:
+                      lastTransitionTime:
+                        format: date-time
+                        type: string
+                      message:
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                type:
+                  type: string
+                vlans:
+                  type: string
+              type: object
+          required:
+            - metadata
+            - spec
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

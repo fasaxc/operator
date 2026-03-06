@@ -359,6 +359,12 @@ func kubeControllersRoleCommonRules(cfg *KubeControllersConfiguration) []rbacv1.
 			Verbs:     []string{"get", "list", "create", "update", "delete", "watch"},
 		},
 		{
+			// Needs to read network configuration for L2 bridge support.
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
+			Resources: []string{"networks"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
 			// Needs to manipulate kubecontrollersconfiguration, which contains
 			// its config.  It creates a default if none exists, and updates status
 			// as well.

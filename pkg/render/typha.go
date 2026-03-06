@@ -286,6 +286,7 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 					"ipamblocks",
 					"ippools",
 					"ipreservations",
+					"networks",
 					"networksets",
 					"tiers",
 				},
