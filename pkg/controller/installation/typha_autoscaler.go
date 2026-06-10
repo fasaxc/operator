@@ -57,6 +57,13 @@ type typhaAutoscaler struct {
 	typhaIndexer   cache.Store
 	nonClusterHost bool
 
+	// hierarchyEnabled, when true, adjusts the replica formula to account for the
+	// leader pod and tier-1 pods added by hierarchical mode.
+	hierarchyEnabled bool
+	// tier1Count is the number of Tier-1 Typha replicas.  Only meaningful when
+	// hierarchyEnabled is true.
+	tier1Count int32
+
 	// Number of currently running replicas.
 	activeReplicas int32
 }
@@ -74,6 +81,16 @@ func typhaAutoscalerOptionPeriod(syncPeriod time.Duration) typhaAutoscalerOption
 func typhaAutoscalerOptionNonclusterHost(nonClusterHost bool) typhaAutoscalerOption {
 	return func(t *typhaAutoscaler) {
 		t.nonClusterHost = nonClusterHost
+	}
+}
+
+// typhaAutoscalerOptionHierarchy is an option that enables the hierarchy-adjusted autoscaling
+// formula.  When hierarchy is enabled, expectedReplicas = legacyFormula(nodes) + 1 (leader) +
+// tier1Count.
+func typhaAutoscalerOptionHierarchy(enabled bool, tier1Count int32) typhaAutoscalerOption {
+	return func(t *typhaAutoscaler) {
+		t.hierarchyEnabled = enabled
+		t.tier1Count = tier1Count
 	}
 }
 
@@ -181,6 +198,14 @@ func (t *typhaAutoscaler) start(ctx context.Context) {
 	}()
 }
 
+// setHierarchyConfig updates the hierarchy-mode configuration used by the autoscaler.
+// It is safe to call from any goroutine: the fields are written before the next autoscale
+// tick reads them, and a missed update is corrected on the following tick.
+func (t *typhaAutoscaler) setHierarchyConfig(enabled bool, tier1Count int32) {
+	t.hierarchyEnabled = enabled
+	t.tier1Count = tier1Count
+}
+
 func (t *typhaAutoscaler) triggerRun() error {
 	errChan := make(chan error)
 	t.triggerRunChan <- errChan
@@ -206,6 +231,11 @@ func (t *typhaAutoscaler) autoscaleReplicas() error {
 		allSchedulableNodes, linuxNodes := t.getNodeCounts()
 		typhaLog.V(5).Info("Number of nodes to consider for typha autoscaling", "all", allSchedulableNodes, "linux", linuxNodes)
 		expectedReplicas = common.GetExpectedTyphaScale(allSchedulableNodes)
+		if t.hierarchyEnabled {
+			// In hierarchical mode the total pod count is the legacy tier-2 follower count
+			// plus 1 leader pod plus the configured number of tier-1 pods.
+			expectedReplicas += 1 + int(t.tier1Count)
+		}
 		if linuxNodes < expectedReplicas {
 			return fmt.Errorf("not enough linux nodes to schedule typha pods on, require %d and have %d", expectedReplicas, linuxNodes)
 		}

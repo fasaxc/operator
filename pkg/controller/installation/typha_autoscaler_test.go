@@ -233,6 +233,45 @@ var _ = Describe("Test typha autoscaler ", func() {
 		verifyTyphaReplicas(c, 2)
 	})
 
+	It("should add leader and tier-1 pods to the replica count when hierarchy is enabled", func() {
+		typhaMeta := metav1.ObjectMeta{
+			Name:      "calico-typha",
+			Namespace: "calico-system",
+		}
+		var r int32 = 0
+		typha := &appsv1.Deployment{
+			TypeMeta:   metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: typhaMeta,
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &r,
+			},
+		}
+		_, err := c.AppsV1().Deployments("calico-system").Create(ctx, typha, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Create 10 linux nodes so there is room for both the non-hierarchy (3) and
+		// hierarchy-adjusted (3 + 1 leader + 2 tier-1 = 6) replica counts.
+		for i := 1; i <= 10; i++ {
+			CreateNode(c, fmt.Sprintf("node%d", i), map[string]string{"kubernetes.io/os": "linux"}, nil)
+		}
+		Eventually(func() []any {
+			return nodeIndexInformer.GetStore().List()
+		}).Should(HaveLen(10))
+
+		// hierarchy off → should get 3 replicas (legacy formula for 10 nodes)
+		ta := newTyphaAutoscaler(c, nodeIndexInformer, tlw, statusManager, typhaAutoscalerOptionPeriod(10*time.Millisecond))
+		ta.start(ctx)
+		verifyTyphaReplicas(c, 3)
+
+		// Enable hierarchy with 2 tier-1 pods: total = 3 (legacy) + 1 (leader) + 2 (tier-1) = 6.
+		ta.setHierarchyConfig(true, 2)
+		verifyTyphaReplicas(c, 6)
+
+		// Disable hierarchy again: back to 3.
+		ta.setHierarchyConfig(false, 0)
+		verifyTyphaReplicas(c, 3)
+	})
+
 	It("should be degraded if there's not enough linux nodes", func() {
 		typhaMeta := metav1.ObjectMeta{
 			Name:      "calico-typha",

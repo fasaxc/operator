@@ -989,6 +989,19 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 	}
 
 	if !installationMarkedForDeletion {
+		// Propagate any change to hierarchy config into the autoscaler before it runs.
+		{
+			var hierEnabled bool
+			var hierTier1Count int32
+			if h := instance.Spec.TyphaHierarchy; h != nil && h.Enabled {
+				hierEnabled = true
+				if h.Tier1Count != nil {
+					hierTier1Count = *h.Tier1Count
+				}
+			}
+			r.typhaAutoscaler.setHierarchyConfig(hierEnabled, hierTier1Count)
+		}
+
 		// If the autoscalar is degraded then trigger a run and recheck the degraded status. If it is still degraded after the
 		// the run the reset the degraded status and requeue the request.
 		if r.typhaAutoscaler.isDegraded() {
@@ -1417,6 +1430,16 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
+	// Derive hierarchy configuration from the Installation API field.
+	var hierarchyEnabled bool
+	var tier1Count int32
+	if h := instance.Spec.TyphaHierarchy; h != nil && h.Enabled {
+		hierarchyEnabled = true
+		if h.Tier1Count != nil {
+			tier1Count = *h.Tier1Count
+		}
+	}
+
 	// Build a configuration for rendering calico/typha.
 	typhaCfg := render.TyphaConfiguration{
 		K8sServiceEp:           k8sapi.Endpoint,
@@ -1427,6 +1450,8 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		ClusterDomain:          r.clusterDomain,
 		NonClusterHost:         nonclusterhost,
 		FelixHealthPort:        *felixConfiguration.Spec.HealthPort,
+		HierarchyEnabled:       hierarchyEnabled,
+		Tier1Count:             tier1Count,
 	}
 	components = append(components, render.Typha(&typhaCfg))
 

@@ -253,6 +253,28 @@ type InstallationSpec struct {
 	// it installs to protect the Calico components it manages.
 	// +optional
 	NetworkPolicy *NetworkPolicySpec `json:"networkPolicy,omitempty"`
+
+	// TyphaHierarchy configures the two-tier hierarchical Typha topology.  When enabled,
+	// a small set of Tier-1 Typha pods sit between the datastore and the bulk of the
+	// Tier-2 follower Typhas, reducing datastore fan-out at scale.
+	// +optional
+	TyphaHierarchy *TyphaHierarchyConfig `json:"typhaHierarchy,omitempty"`
+}
+
+// TyphaHierarchyConfig configures the two-tier hierarchical Typha topology.
+type TyphaHierarchyConfig struct {
+	// Enabled activates the two-tier hierarchical Typha topology.
+	// When false (the default) all Typha instances connect directly to the datastore.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Tier1Count is the number of Tier-1 (upstream) Typha replicas.  These pods
+	// connect directly to the datastore; Tier-2 followers connect to one of them
+	// instead.  Must be >= 0.  Defaults to 0 (operator picks a sensible default
+	// when Enabled is true).
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Tier1Count *int32 `json:"tier1Count,omitempty"`
 }
 
 // BPFNetworkBootstrapType defines how the initial networking configuration is executed.
