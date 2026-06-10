@@ -57,6 +57,28 @@ const (
 
 	defaultTyphaTerminationGracePeriod = 300
 	shutdownTimeoutEnvVar              = "TYPHA_SHUTDOWNTIMEOUTSECS"
+
+	// TyphaLeaderServiceName is the headless Service that the elected leader Typha pod
+	// exposes so that follower Typhas can discover their upstream. The leader applies the
+	// label projectcalico.org/typha-role: leader to itself, and this Service selects on
+	// that label. Only rendered when hierarchical mode is enabled.
+	TyphaLeaderServiceName     = "calico-typha-leader"
+	TyphaLeaderServicePortName = "calico-typha"
+
+	// TyphaRoleLabelKey is the pod label the elected leader applies to itself to be
+	// discoverable via TyphaLeaderServiceName.
+	TyphaRoleLabelKey   = "projectcalico.org/typha-role"
+	TyphaRoleLabelValue = "leader"
+
+	// TyphaHierarchyRoleName is the namespaced Role granting hierarchy-specific RBAC
+	// (leases + pod self-labelling). Rendered only when HierarchyEnabled is true.
+	TyphaHierarchyRoleName = "calico-typha-hierarchy"
+
+	// TyphaTLSClientSecretName is the Secret holding the typha-client keypair.  Typha
+	// uses this when it dials an upstream Typha in hierarchical mode.  It is a
+	// distinct Secret from node-certs (same CN is fine; sharing the private key
+	// between components is not).
+	TyphaTLSClientSecretName = "typha-client-certs"
 )
 
 var (
@@ -85,6 +107,12 @@ type TyphaConfiguration struct {
 	// The health port that Felix is bound to. We configure Typha to bind to the port
 	// that is one less.
 	FelixHealthPort int
+
+	// HierarchyEnabled gates all hierarchical-Typha rendering.  When false (the
+	// default), the rendered objects are byte-identical to the pre-hierarchy output so
+	// that existing clusters are unaffected.  PR2 will replace this internal gate with
+	// a first-class Installation API field (Installation.Spec.TyphaHierarchy.Enabled).
+	HierarchyEnabled bool
 }
 
 // Typha creates the typha daemonset and other resources for the daemonset to operate normally.
@@ -124,6 +152,16 @@ func (c *typhaComponent) Objects() ([]client.Object, []client.Object) {
 		c.typhaRoleBinding(),
 		pdb,
 	}
+
+	// When hierarchical mode is enabled, add the namespaced Role + RoleBinding for
+	// leases/pod-patch RBAC, and the leader-discovery Service.
+	if c.cfg.HierarchyEnabled {
+		objs = append(objs,
+			c.typhaHierarchyRole(),
+			c.typhaHierarchyRoleBinding(),
+		)
+	}
+
 	objs = append(objs, c.typhaServices()...)
 
 	// Add deployment last, as it may depend on the creation of previous objects in the list.
@@ -386,6 +424,71 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 	return role
 }
 
+// typhaHierarchyRole creates a namespaced Role in calico-system granting typha the
+// additional permissions required for hierarchical mode:
+//   - coordination.k8s.io leases: leader election (get/create/update; create cannot
+//     be scoped to a resource name, so it is left unscoped).
+//   - core pods patch: self-labelling so the leader is discoverable via the headless
+//     Service (cannot be name-scoped by the API).
+//
+// Using a namespaced Role rather than widening the ClusterRole follows the principle
+// of least privilege: these permissions are only needed within calico-system.
+func (c *typhaComponent) typhaHierarchyRole() *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      TyphaHierarchyRoleName,
+			Namespace: common.CalicoNamespace,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				// Leader election: get and update can be scoped to the single lease;
+				// create cannot be resource-name-scoped (API limitation).
+				APIGroups: []string{"coordination.k8s.io"},
+				Resources: []string{"leases"},
+				Verbs:     []string{"create"},
+			},
+			{
+				APIGroups:     []string{"coordination.k8s.io"},
+				Resources:     []string{"leases"},
+				Verbs:         []string{"get", "update"},
+				ResourceNames: []string{"calico-typha-leader"},
+			},
+			{
+				// Self-labelling: the elected leader patches its own pod with
+				// projectcalico.org/typha-role: leader so that the headless leader
+				// Service can select it.  Pod patch cannot be resource-name-scoped.
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"patch"},
+			},
+		},
+	}
+}
+
+// typhaHierarchyRoleBinding binds the namespaced hierarchy Role to the typha SA.
+func (c *typhaComponent) typhaHierarchyRoleBinding() *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      TyphaHierarchyRoleName,
+			Namespace: common.CalicoNamespace,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     TyphaHierarchyRoleName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      TyphaServiceAccountName,
+				Namespace: common.CalicoNamespace,
+			},
+		},
+	}
+}
+
 // typhaDeployment creates the typha deployment.
 func (c *typhaComponent) typhaDeployment() []client.Object {
 	// We set a fairly long grace period by default. Typha sheds load during the grace period rather than
@@ -413,6 +516,12 @@ func (c *typhaComponent) typhaDeployment() []client.Object {
 	var initContainers []corev1.Container
 	if c.cfg.TLS.TyphaSecret.UseCertificateManagement() {
 		initContainers = append(initContainers, c.cfg.TLS.TyphaSecret.InitContainer(common.CalicoNamespace, typhaContainer.SecurityContext))
+	}
+	if c.cfg.HierarchyEnabled && c.cfg.TLS.TyphaClientSecret != nil {
+		annotations[c.cfg.TLS.TyphaClientSecret.HashAnnotationKey()] = c.cfg.TLS.TyphaClientSecret.HashAnnotationValue()
+		if c.cfg.TLS.TyphaClientSecret.UseCertificateManagement() {
+			initContainers = append(initContainers, c.cfg.TLS.TyphaClientSecret.InitContainer(common.CalicoNamespace, typhaContainer.SecurityContext))
+		}
 	}
 
 	// Include annotation for prometheus scraping configuration.
@@ -530,10 +639,14 @@ func (c *typhaComponent) applyPostOverrideFixUps(d *appsv1.Deployment) {
 
 // volumes creates the typha's volumes.
 func (c *typhaComponent) volumes() []corev1.Volume {
-	return []corev1.Volume{
+	vols := []corev1.Volume{
 		c.cfg.TLS.TrustedBundle.Volume(),
 		c.cfg.TLS.TyphaSecret.Volume(),
 	}
+	if c.cfg.HierarchyEnabled && c.cfg.TLS.TyphaClientSecret != nil {
+		vols = append(vols, c.cfg.TLS.TyphaClientSecret.Volume())
+	}
+	return vols
 }
 
 func (c *typhaComponent) volumeNonClusterHost() []corev1.Volume {
@@ -545,10 +658,14 @@ func (c *typhaComponent) volumeNonClusterHost() []corev1.Volume {
 
 // typhaVolumeMounts creates the typha's volume mounts.
 func (c *typhaComponent) typhaVolumeMounts() []corev1.VolumeMount {
-	return append(
+	mounts := append(
 		c.cfg.TLS.TrustedBundle.VolumeMounts(c.SupportedOSType()),
 		c.cfg.TLS.TyphaSecret.VolumeMount(c.SupportedOSType()),
 	)
+	if c.cfg.HierarchyEnabled && c.cfg.TLS.TyphaClientSecret != nil {
+		mounts = append(mounts, c.cfg.TLS.TyphaClientSecret.VolumeMount(c.SupportedOSType()))
+	}
+	return mounts
 }
 
 func (c *typhaComponent) typhaVolumeMountsNonClusterHost() []corev1.VolumeMount {
@@ -621,6 +738,49 @@ func (c *typhaComponent) typhaEnvVars(typhaSecret certificatemanagement.KeyPairI
 	}
 	if c.cfg.TLS.TyphaURISAN != "" {
 		typhaEnv = append(typhaEnv, corev1.EnvVar{Name: "TYPHA_CLIENTURISAN", Value: c.cfg.TLS.NodeURISAN})
+	}
+
+	// Downward-API pod identity vars.  Required for leader election (PodName, PodNamespace)
+	// and node-affinity routing (NodeName); injected unconditionally so that any future
+	// feature relying on them is already available without a rolling restart.
+	typhaEnv = append(typhaEnv,
+		corev1.EnvVar{
+			Name: "TYPHA_PODNAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		corev1.EnvVar{
+			Name: "TYPHA_PODNAMESPACE",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			},
+		},
+		corev1.EnvVar{
+			Name: "TYPHA_NODENAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+			},
+		},
+	)
+
+	// Hierarchy and leader-election env vars.  Only rendered when HierarchyEnabled so
+	// that the default deployment is byte-for-byte unchanged except for the downward-API
+	// vars added above (which are always safe).  PR2 will replace HierarchyEnabled with
+	// a first-class Installation API field (Installation.Spec.TyphaHierarchy.Enabled).
+	if c.cfg.HierarchyEnabled {
+		typhaEnv = append(typhaEnv,
+			corev1.EnvVar{Name: "TYPHA_HIERARCHYENABLED", Value: "true"},
+			corev1.EnvVar{Name: "TYPHA_LEADERELECTIONENABLED", Value: "true"},
+		)
+		if c.cfg.TLS.TyphaClientSecret != nil {
+			typhaEnv = append(typhaEnv,
+				corev1.EnvVar{Name: "TYPHA_CLIENTCERTFILE", Value: c.cfg.TLS.TyphaClientSecret.VolumeMountCertificateFilePath()},
+				corev1.EnvVar{Name: "TYPHA_CLIENTKEYFILE", Value: c.cfg.TLS.TyphaClientSecret.VolumeMountKeyFilePath()},
+				corev1.EnvVar{Name: "TYPHA_CLIENTCAFILE", Value: c.cfg.TLS.TrustedBundle.MountPath()},
+				corev1.EnvVar{Name: "TYPHA_UPSTREAMSERVERCN", Value: TyphaCommonName},
+			)
+		}
 	}
 
 	switch c.cfg.Installation.CNI.Type {
@@ -758,14 +918,55 @@ func (c *typhaComponent) typhaServices() []client.Object {
 		},
 	}
 
+	var svcs []client.Object
+	svcs = append(svcs, svc)
+
 	if c.cfg.NonClusterHost != nil {
 		svcNonClusterHost := svc.DeepCopy()
 		svcNonClusterHost.Name += TyphaNonClusterHostSuffix
 		svcNonClusterHost.Labels[AppLabelName] += TyphaNonClusterHostSuffix
 		svcNonClusterHost.Spec.Selector[AppLabelName] += TyphaNonClusterHostSuffix
-		return []client.Object{svc, svcNonClusterHost}
+		svcs = append(svcs, svcNonClusterHost)
 	}
-	return []client.Object{svc}
+
+	if c.cfg.HierarchyEnabled {
+		svcs = append(svcs, c.typhaLeaderService())
+	}
+
+	return svcs
+}
+
+// typhaLeaderService returns the headless Service that exposes the elected leader Typha
+// pod.  The leader applies the label projectcalico.org/typha-role: leader to itself;
+// this Service selects on that label so follower Typhas can discover their upstream.
+// Only rendered when HierarchyEnabled is true.
+func (c *typhaComponent) typhaLeaderService() *corev1.Service {
+	return &corev1.Service{
+		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      TyphaLeaderServiceName,
+			Namespace: common.CalicoNamespace,
+			Labels: map[string]string{
+				AppLabelName: TyphaLeaderServiceName,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			// Headless: follower Typhas DNS-resolve the pod IP directly rather
+			// than going through kube-proxy.
+			ClusterIP: "None",
+			Ports: []corev1.ServicePort{
+				{
+					Port:       TyphaPort,
+					Protocol:   corev1.ProtocolTCP,
+					TargetPort: intstr.FromString(TyphaLeaderServicePortName),
+					Name:       TyphaLeaderServicePortName,
+				},
+			},
+			Selector: map[string]string{
+				TyphaRoleLabelKey: TyphaRoleLabelValue,
+			},
+		},
+	}
 }
 
 // affinity sets the user-specified typha affinity if specified.

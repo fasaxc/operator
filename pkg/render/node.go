@@ -93,6 +93,11 @@ type TyphaNodeTLS struct {
 
 	NodeNonClusterHostCommonName string
 	NodeNonClusterHostURISAN     string
+
+	// TyphaClientSecret is the keypair Typha uses as a TLS client when dialling
+	// an upstream Typha in hierarchical mode (CN typha-client, client-auth usage).
+	// Nil when certificate management is not configured for the cluster.
+	TyphaClientSecret certificatemanagement.KeyPairInterface
 }
 
 // NodeConfiguration is the public API used to provide information to the render code to

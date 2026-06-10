@@ -1758,6 +1758,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		render.TyphaTLSSecretName:                                    typhaNodeTLS.TyphaSecret,
 		render.NodeTLSSecretName:                                     typhaNodeTLS.NodeSecret,
 		render.TyphaTLSSecretName + render.TyphaNonClusterHostSuffix: typhaNodeTLS.TyphaSecretNonClusterHost,
+		render.TyphaTLSClientSecretName:                              typhaNodeTLS.TyphaClientSecret,
 		render.NodePrometheusTLSServerSecret:                         nodePrometheusTLS,
 		kubecontrollers.KubeControllerPrometheusTLSSecret:            kubeControllerTLS,
 	}, r.status)
@@ -1856,6 +1857,12 @@ func getOrCreateTyphaNodeTLSConfig(cli client.Client, certificateManager certifi
 	node, nodeCommonName, nodeURISAN := getOrCreateKeyPair(render.NodeTLSSecretName, render.FelixCommonName, true)
 	typha, typhaCommonName, typhaURISAN := getOrCreateKeyPair(render.TyphaTLSSecretName, render.TyphaCommonName, true)
 	typhaNonClusterHost, _, _ := getOrCreateKeyPair(render.TyphaTLSSecretName+render.TyphaNonClusterHostSuffix, render.TyphaCommonName+render.TyphaNonClusterHostSuffix, false)
+	// typhaClient is the keypair Typha uses as a TLS client when dialling an upstream
+	// Typha in hierarchical mode.  We always provision it so that the Secret is
+	// available before the feature is enabled, and the Deployment pod-template hash
+	// annotation triggers a rolling restart when the cert rotates.  The CN must match
+	// FelixCommonName ("typha-client") so the upstream's TYPHA_CLIENTCN check accepts it.
+	typhaClient, _, _ := getOrCreateKeyPair(render.TyphaTLSClientSecretName, render.FelixCommonName, false)
 	var trustedBundle certificatemanagement.TrustedBundle
 	configMap, err := getConfigMap(cli, render.TyphaCAConfigMapName)
 	if err != nil {
@@ -1888,6 +1895,7 @@ func getOrCreateTyphaNodeTLSConfig(cli client.Client, certificateManager certifi
 		NodeSecret:                node,
 		NodeCommonName:            nodeCommonName,
 		NodeURISAN:                nodeURISAN,
+		TyphaClientSecret:         typhaClient,
 	}, nil
 }
 
