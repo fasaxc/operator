@@ -838,12 +838,36 @@ func replaceOrAppendEnvVar(envVars []corev1.EnvVar, key, value string) []corev1.
 	return envVars
 }
 
+// hierarchyEnvVarNames are the env var names that relate to hierarchical Typha mode.
+// The NCH Typha does not participate in hierarchy so these must be stripped from
+// its env.
+var hierarchyEnvVarNames = map[string]struct{}{
+	"TYPHA_HIERARCHYENABLED":   {},
+	"TYPHA_LEADERELECTIONENABLED": {},
+	"TYPHA_CLIENTCERTFILE":     {},
+	"TYPHA_CLIENTKEYFILE":      {},
+	"TYPHA_CLIENTCAFILE":       {},
+	"TYPHA_UPSTREAMSERVERCN":   {},
+	// Downward-API vars are also NCH-irrelevant (leader election / node-affinity
+	// routing only apply to in-cluster Typhas).
+	"TYPHA_PODNAME":      {},
+	"TYPHA_PODNAMESPACE": {},
+	"TYPHA_NODENAME":     {},
+}
+
 func (c *typhaComponent) typhaEnvVarsNonClusterHost() []corev1.EnvVar {
 	// Update Typha client common name or URISAN for non-cluster hosts.
 	// At least one of TYPHA_CLIENTCN or TYPHA_CLIENTURISAN must be set.
 	envVars := c.typhaEnvVars(c.cfg.TLS.TyphaSecretNonClusterHost)
 	envVars = replaceOrAppendEnvVar(envVars, "TYPHA_CLIENTCN", c.cfg.TLS.NodeNonClusterHostCommonName)
 	envVars = replaceOrAppendEnvVar(envVars, "TYPHA_CLIENTURISAN", c.cfg.TLS.NodeNonClusterHostURISAN)
+
+	// Strip hierarchy-related env vars: the NCH Typha does not participate in
+	// leader election or hierarchical routing.
+	envVars = slices.DeleteFunc(envVars, func(e corev1.EnvVar) bool {
+		_, isHierarchy := hierarchyEnvVarNames[e.Name]
+		return isHierarchy
+	})
 
 	// NCH Typha runs pod-networked, so the host-network apiserver endpoint
 	// (e.g. MKE's proxy.local) may not be reachable. Strip the inherited env

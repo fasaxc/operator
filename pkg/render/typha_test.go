@@ -899,4 +899,190 @@ var _ = Describe("Typha rendering tests", func() {
 			Expect(pdb.Annotations).To(HaveKeyWithValue("custom", "ann"))
 		})
 	})
+
+	// Hierarchical Typha tests.  These cover PR1 of WS-G: RBAC, downward-API env,
+	// hierarchy/election env gating, leader Service, and typha-client cert wiring.
+	Describe("Hierarchical Typha (HierarchyEnabled gate)", func() {
+
+		It("gate-off: rendered objects are byte-identical to the pre-hierarchy baseline", func() {
+			// HierarchyEnabled defaults to false — cfg.HierarchyEnabled is not set.
+			// The rendered resource list must exactly match the pre-hierarchy list
+			// (no hierarchy Role, no hierarchy RoleBinding, no leader Service).
+			expectedResources := []struct {
+				name    string
+				ns      string
+				group   string
+				version string
+				kind    string
+			}{
+				{name: "calico-typha", ns: "calico-system", group: "", version: "v1", kind: "ServiceAccount"},
+				{name: "calico-typha", ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
+				{name: "calico-typha", ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
+				{name: "calico-typha", ns: "calico-system", group: "policy", version: "v1", kind: "PodDisruptionBudget"},
+				{name: "calico-typha", ns: "calico-system", group: "", version: "v1", kind: "Service"},
+				{name: "calico-typha-noncluster-host", ns: "calico-system", group: "", version: "v1", kind: "Service"},
+				{name: "calico-typha", ns: "calico-system", group: "apps", version: "v1", kind: "Deployment"},
+				{name: "calico-typha-noncluster-host", ns: "calico-system", group: "apps", version: "v1", kind: "Deployment"},
+			}
+
+			component := render.Typha(&cfg)
+			Expect(component.ResolveImages(nil)).To(BeNil())
+			resources, _ := component.Objects()
+			Expect(resources).To(HaveLen(len(expectedResources)))
+			for i, exp := range expectedResources {
+				rtest.ExpectResourceTypeAndObjectMetadata(resources[i], exp.name, exp.ns, exp.group, exp.version, exp.kind)
+			}
+
+			// No hierarchy Role or RoleBinding should exist.
+			Expect(rtest.GetResource(resources, render.TyphaHierarchyRoleName, "calico-system", "rbac.authorization.k8s.io", "v1", "Role")).To(BeNil())
+			Expect(rtest.GetResource(resources, render.TyphaHierarchyRoleName, "calico-system", "rbac.authorization.k8s.io", "v1", "RoleBinding")).To(BeNil())
+			// No leader Service.
+			Expect(rtest.GetResource(resources, render.TyphaLeaderServiceName, "calico-system", "", "v1", "Service")).To(BeNil())
+
+			// No hierarchy env vars on the typha container.
+			d := rtest.GetResource(resources, "calico-typha", "calico-system", "apps", "v1", "Deployment").(*appsv1.Deployment)
+			var envNames []string
+			for _, e := range d.Spec.Template.Spec.Containers[0].Env {
+				envNames = append(envNames, e.Name)
+			}
+			Expect(envNames).NotTo(ContainElement("TYPHA_HIERARCHYENABLED"))
+			Expect(envNames).NotTo(ContainElement("TYPHA_LEADERELECTIONENABLED"))
+			Expect(envNames).NotTo(ContainElement("TYPHA_CLIENTCERTFILE"))
+			Expect(envNames).NotTo(ContainElement("TYPHA_CLIENTKEYFILE"))
+			Expect(envNames).NotTo(ContainElement("TYPHA_CLIENTCAFILE"))
+			Expect(envNames).NotTo(ContainElement("TYPHA_UPSTREAMSERVERCN"))
+
+			// But downward-API vars ARE present (always injected).
+			Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:      "TYPHA_PODNAME",
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+			}))
+			Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:      "TYPHA_PODNAMESPACE",
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}},
+			}))
+			Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:      "TYPHA_NODENAME",
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}},
+			}))
+		})
+
+		It("gate-on: renders hierarchy RBAC, leader Service, env vars, and client cert", func() {
+			// Construct a TyphaClientSecret alongside the usual node/typha keypairs.
+			certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
+			Expect(err).NotTo(HaveOccurred())
+			tls := getTyphaNodeTLS(cli, certificateManager)
+			typhaClientKeyPair, err := certificateManager.GetOrCreateKeyPair(
+				cli,
+				render.TyphaTLSClientSecretName,
+				common.OperatorNamespace(),
+				[]string{render.FelixCommonName},
+			)
+			Expect(err).NotTo(HaveOccurred())
+			tls.TyphaClientSecret = typhaClientKeyPair
+
+			cfg.TLS = tls
+			cfg.HierarchyEnabled = true
+
+			component := render.Typha(&cfg)
+			Expect(component.ResolveImages(nil)).To(BeNil())
+			resources, _ := component.Objects()
+
+			// Hierarchy Role + RoleBinding must be present.
+			role := rtest.GetResource(resources, render.TyphaHierarchyRoleName, "calico-system", "rbac.authorization.k8s.io", "v1", "Role")
+			Expect(role).NotTo(BeNil())
+			r := role.(*rbacv1.Role)
+			Expect(r.Namespace).To(Equal("calico-system"))
+			// Verify lease create rule (unscoped) and get/update rule (scoped to calico-typha-leader).
+			var hasLeaseCreate, hasLeaseScopedGetUpdate, hasPodPatch bool
+			for _, rule := range r.Rules {
+				if len(rule.APIGroups) == 1 && rule.APIGroups[0] == "coordination.k8s.io" {
+					if len(rule.ResourceNames) == 0 && containsAll(rule.Verbs, "create") {
+						hasLeaseCreate = true
+					}
+					if len(rule.ResourceNames) == 1 && rule.ResourceNames[0] == "calico-typha-leader" &&
+						containsAll(rule.Verbs, "get", "update") {
+						hasLeaseScopedGetUpdate = true
+					}
+				}
+				if len(rule.APIGroups) == 1 && rule.APIGroups[0] == "" &&
+					len(rule.Resources) == 1 && rule.Resources[0] == "pods" &&
+					containsAll(rule.Verbs, "patch") {
+					hasPodPatch = true
+				}
+			}
+			Expect(hasLeaseCreate).To(BeTrue(), "Role should have coordination.k8s.io leases create (unscoped)")
+			Expect(hasLeaseScopedGetUpdate).To(BeTrue(), "Role should have coordination.k8s.io leases get/update scoped to calico-typha-leader")
+			Expect(hasPodPatch).To(BeTrue(), "Role should have pods patch for self-labelling")
+
+			rb := rtest.GetResource(resources, render.TyphaHierarchyRoleName, "calico-system", "rbac.authorization.k8s.io", "v1", "RoleBinding")
+			Expect(rb).NotTo(BeNil())
+			roleBinding := rb.(*rbacv1.RoleBinding)
+			Expect(roleBinding.RoleRef.Name).To(Equal(render.TyphaHierarchyRoleName))
+			Expect(roleBinding.RoleRef.Kind).To(Equal("Role"))
+			Expect(roleBinding.Subjects).To(ContainElement(rbacv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      render.TyphaServiceAccountName,
+				Namespace: "calico-system",
+			}))
+
+			// Leader Service must be headless and select on the typha-role label.
+			leaderSvc := rtest.GetResource(resources, render.TyphaLeaderServiceName, "calico-system", "", "v1", "Service")
+			Expect(leaderSvc).NotTo(BeNil())
+			svc := leaderSvc.(*corev1.Service)
+			Expect(svc.Spec.ClusterIP).To(Equal("None"), "leader Service must be headless")
+			Expect(svc.Spec.Selector).To(HaveKeyWithValue(render.TyphaRoleLabelKey, render.TyphaRoleLabelValue))
+			Expect(svc.Spec.Ports).To(HaveLen(1))
+			Expect(svc.Spec.Ports[0].Name).To(Equal(render.TyphaLeaderServicePortName))
+			Expect(svc.Spec.Ports[0].Port).To(BeEquivalentTo(render.TyphaPort))
+
+			// Hierarchy env vars on the main typha container.
+			d := rtest.GetResource(resources, "calico-typha", "calico-system", "apps", "v1", "Deployment").(*appsv1.Deployment)
+			env := d.Spec.Template.Spec.Containers[0].Env
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: "TYPHA_HIERARCHYENABLED", Value: "true"}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: "TYPHA_LEADERELECTIONENABLED", Value: "true"}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: "TYPHA_CLIENTCERTFILE", Value: typhaClientKeyPair.VolumeMountCertificateFilePath()}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: "TYPHA_CLIENTKEYFILE", Value: typhaClientKeyPair.VolumeMountKeyFilePath()}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: "TYPHA_UPSTREAMSERVERCN", Value: render.TyphaCommonName}))
+
+			// Client cert volume and mount must be present on the main deployment.
+			Expect(d.Spec.Template.Spec.Volumes).To(ContainElement(
+				gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+					"Name": Equal(render.TyphaTLSClientSecretName),
+				}),
+			))
+			Expect(d.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(
+				gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+					"Name": Equal(render.TyphaTLSClientSecretName),
+				}),
+			))
+
+			// Downward-API vars still present.
+			Expect(env).To(ContainElement(corev1.EnvVar{
+				Name:      "TYPHA_PODNAME",
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+			}))
+
+			// The non-cluster-host deployment should NOT have the client cert (hierarchy
+			// not applicable to NCH path).
+			dNCH := rtest.GetResource(resources, "calico-typha-noncluster-host", "calico-system", "apps", "v1", "Deployment").(*appsv1.Deployment)
+			for _, e := range dNCH.Spec.Template.Spec.Containers[0].Env {
+				Expect(e.Name).NotTo(Equal("TYPHA_HIERARCHYENABLED"))
+			}
+		})
+	})
 })
+
+// containsAll returns true when slice contains all of the required items.
+func containsAll(slice []string, items ...string) bool {
+	set := make(map[string]struct{}, len(slice))
+	for _, s := range slice {
+		set[s] = struct{}{}
+	}
+	for _, item := range items {
+		if _, ok := set[item]; !ok {
+			return false
+		}
+	}
+	return true
+}
